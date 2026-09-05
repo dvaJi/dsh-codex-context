@@ -1,0 +1,17 @@
+# Development overlay: load dsh-codex-context from this source checkout into a
+# dsh run-from-source composition without installing it as a package.
+#
+#   pnpm build
+#   pnpm dsh web --patch ./dev/cordis.dev.yml
+#
+# The row overrides the base `compaction-basic` row by id, the same move the
+# bundle's cordis.patch.yml performs on install. Replace <abs-path-to-repo>
+# with this checkout's absolute path.
+
+- insert:
+    - id: compaction-basic
+      name: '<abs-path-to-repo>/lib/index.js'
+      config:
+        targetActiveTokens: 35000
+        minRetainedNodes: 6
+        emergencyThresholdRatio: 0.85
