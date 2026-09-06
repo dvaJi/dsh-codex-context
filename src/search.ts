@@ -67,31 +67,32 @@ export function registerSearch(ctx: Context, config: CodexContextConfig): void {
       },
     },
     output: {
+      // Requiredness is declared per property (the value-schema DSL has no
+      // JSON-schema-style top-level `required` array).
       schema: {
         type: 'object',
+        additionalProperties: false,
         properties: {
-          query: { type: 'string' },
-          total: { type: 'integer', description: 'Number of hits returned' },
-          scanned: { type: 'integer', description: 'Number of log events scanned' },
+          query: { type: 'string', required: true },
+          total: { type: 'integer', required: true, description: 'Number of hits returned' },
+          scanned: { type: 'integer', required: true, description: 'Number of log events scanned' },
           hits: {
             type: 'array',
+            required: true,
             items: {
               type: 'object',
+              additionalProperties: false,
               properties: {
-                seq: { type: 'integer' },
-                kind: { type: 'string' },
-                cold: { type: 'boolean' },
+                seq: { type: 'integer', required: true },
+                kind: { type: 'string', required: true },
+                cold: { type: 'boolean', required: true },
                 turn: { type: 'integer' },
                 step: { type: 'integer' },
-                excerpt: { type: 'string' },
+                excerpt: { type: 'string', required: true },
               },
-              required: ['seq', 'kind', 'cold', 'excerpt'],
-              additionalProperties: false,
             },
           },
         },
-        required: ['query', 'total', 'scanned', 'hits'],
-        additionalProperties: false,
       },
       render: (_args, value) => [{
         type: 'text',

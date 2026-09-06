@@ -1,19 +1,23 @@
 # dsh-codex-context bundle layer.
 #
 # Applied after @deepseek-ai/dsh-base when this bundle is listed in a profile's
-# `dsh.profile.bundles`. The single row below overrides the base `compaction-basic`
-# row by id (later layers win per row), replacing the shipped LLM-summarizing
-# backend with the Codex-style windowing engine from this package.
+# `dsh.profile.bundles`. Replacing the shipped LLM-summarizing backend is a
+# two-step row patch: a leaf row's `name` cannot be rewritten in place and two
+# rows sharing one id are rejected at mount, so this layer disables the base
+# `compaction-basic` row and mounts this engine as its own row.
 #
 # `command-compact` and `tool-result-pruner` (both mounted by dsh-base) keep
 # working unchanged: the /compact command consumes whatever `ctx.compaction`
-# provides, and this engine invokes the optional pruner before windowing.
+# provides (this engine now), and this engine invokes the optional pruner
+# before windowing.
 #
-# Users can re-tune this row from their profile's cordis.patch.yml by id; a
-# patch replaces the whole `config` value rather than deep-merging, so an
-# override must restate every key it cares about. Omitting `config` entirely
-# keeps the schema defaults shown in README.md.
+# Users can re-tune this row from their profile's cordis.patch.yml by id
+# (`codex-context`); a patch replaces the whole `config` value rather than
+# deep-merging, so an override must restate every key it cares about. Omitting
+# `config` entirely keeps the schema defaults shown in README.md.
 
+- id: compaction-basic
+  disabled: true
 - insert:
-    - id: compaction-basic
+    - id: codex-context
       name: dsh-codex-context
