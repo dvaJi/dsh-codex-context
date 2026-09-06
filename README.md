@@ -38,10 +38,10 @@ This plugin composes those into the 3-tier architecture:
 
 ### What the engine does
 
-- **Token-aware sliding window** — when the priced surface exceeds `targetActiveTokens` (default 35,000), the engine walks backwards accumulating node prices and shadows the oldest balanced span until the retained tail fits the budget.
-- **Zero-orphan boundaries** — cut edges are validated with the compaction seam's `toolPairingBalancedBefore/After`, so a tool call is never separated from its result (Codex's `normalize` invariants), and the minimum recent tail is always retained verbatim.
+- **Token-aware sliding window** — when the priced surface exceeds the effective budget (config `targetActiveTokens`, capped at `emergencyThresholdRatio` of a routed context window too small to ever reach the configured target), the engine walks backwards accumulating node prices and shadows the oldest balanced span until the retained tail fits the budget, snapping the cut to a whole-turn boundary whenever the budget allows it.
+- **Zero-orphan boundaries** — both cut edges are validated with the compaction seam's `toolPairingBalancedBefore/After`, so a tool call is never separated from its result (Codex's `normalize` invariants), and the minimum recent tail is always retained verbatim.
 - **Model-free checkpoints** — routine windowing writes a tiny template checkpoint (`[Window Checkpoint]` + retrieval guidance) instead of paying an LLM call. The raw span stays queryable.
-- **Emergency parachute (Codex behavior)** — Codex windows routinely but *summarizes* near the limit (auto-compact with `SUMMARIZATION_PROMPT`). Likewise, when metered pressure crosses `emergencyThresholdRatio` (default 0.85) of the routed model's context window, the engine writes a real structured model summary through `ctx.llm.stream()` — reusing the conversation's system prompt, tools, and shadowed messages as a warm prefix — instead of the template.
+- **Emergency parachute (Codex behavior)** — Codex windows routinely but *summarizes* near the limit (auto-compact with `SUMMARIZATION_PROMPT`). Likewise, when routine step pressure crosses `emergencyThresholdRatio` (default 0.85) of the routed model's context window, the engine writes a real structured model summary through `ctx.llm.stream()` — reusing the conversation's system prompt, tools, and shadowed messages as a warm prefix — instead of the template. The parachute is best-effort: a failed or truncated summary degrades to the template checkpoint, and provider-confirmed overflows (`CONTEXT_WINDOW_EXCEEDED`) skip it entirely — a further near-limit model call would most likely fail and block the only reduction that can succeed.
 - **Durable transaction** — every windowing operation follows the compaction seam contract: the `compaction/start` … `compaction/end` log-recorded lock, whole-surface or selected-span stability revalidation, shrink validation against the token meter, and exactly one close attempt per failure. Overflow recovery (`CONTEXT_WINDOW_EXCEEDED`) retries after a durable replacement advances the surface generation.
 
 ### What the model gets
@@ -49,7 +49,7 @@ This plugin composes those into the 3-tier architecture:
 | Tool | Purpose |
 |---|---|
 | `update_notes` | Update the persistent working notes (goals, modified files, constraints, next steps). Pinned at the top of every subsequent request; survives windowing, compaction, and restarts. |
-| `search_history` | Regex/keyword search over the **full** session log — user prompts, assistant messages (including reasoning), tool calls, and complete tool outputs. Cold (shadowed) history is searched first; excerpts are centered on the match position, not sliced from offset 0. |
+| `search_history` | Regex/keyword search over the **full** session log — user prompts, assistant messages (including reasoning), tool calls, and complete tool outputs. Cold (shadowed) history is searched first; excerpts are centered on the match position, not sliced from offset 0. Queries are case-insensitive keywords or regexes of at most 512 characters; an empty or whitespace-only query is rejected. |
 
 Notes persistence needs **no custom session event type**: the agent loop already logs dynamic runtime contexts as durable `user/message` snapshots (`source: @deepseek-ai/dsh-system-prompt`, `form: 'snapshot'`) whenever the rendered text changes, and re-logs the snapshot after compaction removes it. Restoring notes is a backward fold over the log for the latest `codex-context:notes` section.
 
@@ -76,7 +76,7 @@ dsh plugin --profile demo add github:dvaJi/dsh-codex-context#<sha>
 #     dsh-codex-context: true
 ```
 
-Or ship a tarball: `pnpm pack` → `dsh plugin --profile demo add ./dsh-codex-context-0.1.0.tgz`.
+Or ship a tarball: `pnpm pack` → `dsh plugin --profile demo add ./dsh-codex-context-0.1.1.tgz`.
 
 ### Keep summarizing compaction, add only the retrieval layer
 
@@ -99,14 +99,14 @@ Everything is a config field; all values are optional (schema defaults shown). A
 | Field | Default | Meaning |
 |---|---|---|
 | `auto` | `true` | Automatic windowing (`agent/pre-step` pressure) and overflow recovery (`agent/request-error`). |
-| `targetActiveTokens` | `35000` | Token budget for the active window; the backwards walk shadows older nodes until the tail fits. |
+| `targetActiveTokens` | `35000` | Token budget for the active window; the backwards walk shadows older nodes until the tail fits. When the routed model's context window is smaller than `targetActiveTokens / emergencyThresholdRatio`, the effective budget is capped at `emergencyThresholdRatio × contextWindow` so windowing runs pre-emptively instead of waiting for an overflow. |
 | `minRetainedNodes` | `6` | Recent surface nodes always retained verbatim. |
 | `maxExcerptLength` | `1000` | Character budget per match-centered search excerpt. |
 | `searchDefaultLimit` | `3` | `search_history` result cap when the model omits `limit`. |
 | `searchMaxScanEvents` | `20000` | Safety cap on log events scanned per search call. |
 | `emergencyThresholdRatio` | `0.85` | Pressure fraction of the context window above which the engine writes a real model summary (the parachute). |
 | `emergencySummarization` | `true` | Master switch for the parachute; `false` keeps windowing model-free at all times. |
-| `summarizationProvider` / `summarizationModel` | `''` | Fixed route for the emergency summarizer; empty uses the routed request target, then `AgentOptions`. |
+| `summarizationProvider` / `summarizationModel` | `''` | Fixed route for the emergency summarizer; empty uses the routed request target, then `AgentOptions`. Configure both as a pair (both empty or both set) or the plugin refuses to load. |
 | `emergencyMaxTokens` | `8192` | Output cap for the emergency summarization request. |
 | `maxOverflowRetries` | `1` | Extra windowing attempts after a provider-confirmed context overflow. |
 | `notesHint` | hint text | Line appended under the pinned notes snapshot; empty disables it. |
