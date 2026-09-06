@@ -36,6 +36,12 @@ export interface HistoryHit {
 }
 
 /**
+ * Upper bound on the query length, guarding the synchronous matcher against
+ * unbounded construction and pathological backtracking on huge tool outputs.
+ */
+const MAX_QUERY_LENGTH = 512
+
+/**
  * Register the `search_history` tool.
  */
 export function registerSearch(ctx: Context, config: CodexContextConfig): void {
@@ -48,11 +54,11 @@ export function registerSearch(ctx: Context, config: CodexContextConfig): void {
       query: {
         type: 'string',
         required: true,
-        description: 'Keyword or regular expression (case-insensitive); invalid regex falls back to literal matching',
+        description: 'Keyword or regular expression (case-insensitive, at most 512 characters); invalid regex falls back to literal matching',
       },
       limit: {
         type: 'integer',
-        description: 'Maximum number of matches to return',
+        description: 'Maximum number of matches to return (defaults to the configured searchDefaultLimit; values are clamped to the configured scan cap)',
       },
       scope: {
         type: 'string',
@@ -102,13 +108,20 @@ export function registerSearch(ctx: Context, config: CodexContextConfig): void {
       if (session === undefined) {
         throw new Error('search_history requires an agent-owned session (no live session is attached to this call)')
       }
-      const limit = args.limit ?? config.searchDefaultLimit
+      const rawLimit = args.limit
+      // Both the caller-provided limit and the configured default are clamped
+      // to the scan cap, so a misconfigured searchDefaultLimit cannot bypass
+      // the guardrails.
+      const limit = typeof rawLimit === 'number' && Number.isInteger(rawLimit) && rawLimit > 0
+        ? Math.min(rawLimit, config.searchMaxScanEvents)
+        : Math.min(config.searchDefaultLimit, config.searchMaxScanEvents)
       const scope = args.scope ?? 'cold_only'
       return searchSession(session, exec.callId, args.query, {
         limit,
         scope,
         maxExcerptLength: config.maxExcerptLength,
         maxScanEvents: config.searchMaxScanEvents,
+        signal: exec.signal,
       })
     },
   }))
@@ -119,9 +132,27 @@ export function searchSession(
   session: Session,
   callerCallId: string,
   query: string,
-  options: { limit: number; scope: 'cold_only' | 'all'; maxExcerptLength: number; maxScanEvents: number },
+  options: {
+    limit: number
+    scope: 'cold_only' | 'all'
+    maxExcerptLength: number
+    maxScanEvents: number
+    signal?: AbortSignal
+  },
 ): { query: string; total: number; scanned: number; hits: HistoryHit[] } {
-  const matcher = compileMatcher(query)
+  const trimmedQuery = query.trim()
+  // An empty pattern would match every event and return arbitrary cold
+  // history; refuse it instead of answering nonsense.
+  if (trimmedQuery.length === 0) {
+    throw new Error('search_history: query must be a non-empty keyword or regular expression')
+  }
+  if (trimmedQuery.length > MAX_QUERY_LENGTH) {
+    throw new Error(
+      `search_history: query is ${trimmedQuery.length} characters; keep it at or under ${MAX_QUERY_LENGTH} `
+      + 'to bound the matcher cost',
+    )
+  }
+  const matcher = compileMatcher(trimmedQuery)
 
   // Stop before the event that invoked this search so the query text riding
   // the tool call can never match itself.
@@ -133,19 +164,26 @@ export function searchSession(
   let scanned = 0
 
   // Cold first (newest to oldest), then the active window (newest to oldest):
-  // forgotten records outrank what the model can already see.
+  // forgotten records outrank what the model can already see. The traversal
+  // honors cancellation so an aborted request does not pay for a
+  // history-sized allocation up front.
   const scanOrder: Array<{ seq: number; cold: boolean }> = []
   for (let index = upperBound - 1; index >= 0; index -= 1) {
+    if (options.signal?.aborted === true) break
     if (!cold.has(index)) scanOrder.push({ seq: index, cold: true })
   }
   if (options.scope === 'all') {
     for (let index = upperBound - 1; index >= 0; index -= 1) {
+      if (options.signal?.aborted === true) break
       if (cold.has(index)) scanOrder.push({ seq: index, cold: false })
     }
   }
 
   for (const entry of scanOrder) {
     if (hits.length >= options.limit || scanned >= options.maxScanEvents) break
+    // Cooperative cancellation: return the matches collected so far instead of
+    // throwing, so an aborted turn keeps partial, honest results.
+    if (options.signal?.aborted === true) break
     const event: SessionEvent | undefined = session.eventAt(SessionSeq(entry.seq))
     if (event === undefined || !isSearchableType(event.type)) continue
     scanned += 1
@@ -166,7 +204,7 @@ export function searchSession(
     hits.push(hit)
   }
 
-  return { query, total: hits.length, scanned, hits }
+  return { query: trimmedQuery, total: hits.length, scanned, hits }
 }
 
 /** Find the log seq of this execution's own tool/call event, if already appended. */

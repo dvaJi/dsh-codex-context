@@ -5,19 +5,24 @@
  * `context_management` architecture from Codex 0.153:
  *
  * - **Token-budgeted sliding window** — when the surface's priced token total
- *   exceeds `targetActiveTokens`, the oldest balanced span is shadowed with a
- *   model-free template checkpoint until the retained tail fits the budget.
+ *   exceeds the effective budget (config `targetActiveTokens`, capped at
+ *   `emergencyThresholdRatio` of a routed context window too small to reach
+ *   it), the oldest balanced span is shadowed with a model-free template
+ *   checkpoint until the retained tail fits the budget.
  * - **Lossless by construction** — dsh's session log is append-only; the
  *   window replacement shadows nodes via `surfaceOp: 'replace'` and the raw
  *   events stay in the log forever. `search_history` reads them back.
- * - **Pair-safe cuts** — edges are snapped to boundaries validated with the
- *   compaction seam's `toolPairingBalancedBefore/After`, so a tool call is
+ * - **Pair-safe cuts** — both edges are snapped to boundaries validated with
+ *   the compaction seam's `toolPairingBalancedBefore/After`, so a tool call is
  *   never separated from its result (Codex's `normalize` invariants).
- * - **Emergency parachute** — when pressure crosses
+ * - **Emergency parachute** — when routine step pressure crosses
  *   `emergencyThresholdRatio` of the routed model's context window, the
  *   engine writes a real model summary instead of the template checkpoint,
  *   mirroring Codex's auto-compact: windowing is the routine regime,
- *   summarization is the safety net.
+ *   summarization is the safety net. Provider-confirmed overflows skip the
+ *   parachute (a near-limit model call could not be trusted to succeed) and
+ *   always use the template window; a failed parachute degrades to the same
+ *   template instead of leaving the session stuck above the budget.
  *
  * The durable transaction follows the compaction seam contract: tail-inspected
  * lock (`compaction/start` … `compaction/end` bracket), whole-surface or
@@ -35,6 +40,7 @@ import {
   CompactionId,
   ManualCompactionError,
   compactCheckpointSource,
+  toolPairingBalancedAfter,
   toolPairingBalancedBefore,
 } from '@deepseek-ai/dsh-compaction'
 import type {
@@ -212,10 +218,14 @@ export class CodexContextEngine extends CompactionEngine {
 
   /**
    * Window for step-boundary pressure or one provider-confirmed context
-   * overflow. Pressure compares the priced surface against
-   * `targetActiveTokens`; overflow forces a maximal balanced head reduction.
-   * When pressure also crosses the emergency ratio of the routed context
-   * window, a real model summary replaces the template checkpoint.
+   * overflow. Pressure compares the priced surface against the effective
+   * budget (the configured `targetActiveTokens`, capped at the emergency
+   * ratio of the routed context window when that window is smaller);
+   * overflow forces a maximal balanced head reduction. The real model
+   * summary (the parachute) is reserved for routine pressure near the
+   * routed window's emergency ratio; overflow recovery is always the
+   * model-free template window because a further near-limit model call
+   * could not be trusted to succeed.
    */
   override async compactIfNeeded(
     agent: CompactionAgentContext,
@@ -223,21 +233,34 @@ export class CodexContextEngine extends CompactionEngine {
     signal: AbortSignal,
   ): Promise<CompactionResult | null> {
     const meter = this.ctx.tokenMeter
-    let measurement = meter.measure(agent.session)
-    if (trigger === 'pressure' && measurement.totalTokens <= this.config.targetActiveTokens) return null
+    const session = agent.session
+    // The pressure budget is the configured active-window target, capped at
+    // the routed model's emergency ratio for context windows smaller than
+    // targetActiveTokens / emergencyThresholdRatio: such a window can never
+    // reach the configured target, so the engine must window pre-emptively at
+    // ratio × contextWindow instead of waiting for a provider-confirmed
+    // overflow on every long turn.
+    const { budget, capped } = this.windowingBudget(session)
+    let measurement = meter.measure(session)
+    if (trigger === 'pressure' && measurement.totalTokens <= budget) return null
 
     // The optional pruner is model-free; land it before selecting a span and
     // remeasure — it may remove the need to window at all.
     const pruner = this.ctx.get('toolResultPruner')
     if (pruner !== undefined) {
-      pruner.pruneSession(agent.session)
-      measurement = meter.measure(agent.session)
-      if (trigger === 'pressure' && measurement.totalTokens <= this.config.targetActiveTokens) return null
+      pruner.pruneSession(session)
+      measurement = meter.measure(session)
+      if (trigger === 'pressure' && measurement.totalTokens <= budget) return null
     }
 
-    const plan = this.selectPlan(agent.session, measurement, trigger)
+    const plan = this.selectPlan(session, measurement, trigger, budget)
     if (plan === null) return null
-    const useSummary = this.shouldSummarize(agent.session, measurement)
+    // The emergency parachute is pre-emptive only. Once the provider has
+    // confirmed a context overflow, recovery must be the model-free template
+    // window: a further near-limit model call replays nearly the whole log
+    // and would most likely fail again, blocking the only reduction that can
+    // actually succeed.
+    const useSummary = trigger === 'pressure' && this.shouldSummarize(session, measurement, capped)
     const head = agent.session.surface.nodes[0]
     const tail = agent.session.surface.nodes[plan.cutIdx - 1]
     if (head === undefined || tail === undefined) {
@@ -308,6 +331,12 @@ export class CodexContextEngine extends CompactionEngine {
         }
       })
     } catch (error: unknown) {
+      // A classified transaction failure ('changed', 'summary', 'commit',
+      // persistence') must reach the /compact command as itself, not as a
+      // misleading 'busy'. Only failures that predate the transaction (the
+      // agent is not idle or the maintenance admission was refused) get the
+      // busy classification.
+      if (error instanceof ManualCompactionError) throw error
       throw new ManualCompactionError(
         'busy',
         'manual windowing requires an idle agent with no waking queued work',
@@ -375,26 +404,53 @@ export class CodexContextEngine extends CompactionEngine {
     session: Session,
     measurement: TokenMeasurement,
     trigger: CompactionTrigger,
+    budget: number,
   ): WindowCutPlan | null {
     const nodes = this.surfaceWindowNodes(session, measurement)
     const options = {
-      targetTokens: this.config.targetActiveTokens,
+      targetTokens: budget,
       minRetainedNodes: this.config.minRetainedNodes,
     }
     const plan = trigger === 'context-overflow'
       ? planOverflowCut(nodes, options)
-      : planWindowCut(nodes, options)
+      // Pressure prefers the budget cut. When even the minimum retained tail
+      // cannot fit the budget (huge recent nodes, or a capped budget smaller
+      // than that tail), no budget cut exists: fall back to the maximal legal
+      // reduction instead of skipping windowing and waiting for a
+      // provider-confirmed overflow.
+      : planWindowCut(nodes, options) ?? planOverflowCut(nodes, options)
     if (plan === null || plan.shadowed.length === 0) return null
     return plan
   }
 
   /**
+   * Resolve the effective active-window budget for one session. When the
+   * routed model's context window is too small to ever reach
+   * `targetActiveTokens`, the budget is capped at `emergencyThresholdRatio`
+   * of that window so routine windowing keeps requests inside it; otherwise
+   * the configured target stands.
+   */
+  private windowingBudget(session: Session): { budget: number; capped: boolean } {
+    const target = this.config.targetActiveTokens
+    const contextWindow = session.requestContext()?.contextWindow
+    if (contextWindow === undefined || contextWindow <= 0) return { budget: target, capped: false }
+    const cap = Math.floor(contextWindow * this.config.emergencyThresholdRatio)
+    // `<=` on purpose: when the cap equals the target (contextWindow =
+    // target / ratio) windowing and the parachute would otherwise fire on the
+    // very same pressure and summarize every routine cut.
+    if (cap <= target) return { budget: cap, capped: true }
+    return { budget: target, capped: false }
+  }
+
+  /**
    * Parachute decision: summarize only when the metered pressure crosses the
    * emergency ratio of the routed model's context window — Codex permits its
-   * auto-compact only near the limit and windows the rest of the time.
+   * auto-compact only near the limit and windows the rest of the time. A
+   * budget already capped by that same ratio leaves nothing for the
+   * parachute to add, so the model-free regime applies.
    */
-  private shouldSummarize(session: Session, measurement: TokenMeasurement): boolean {
-    if (!this.config.emergencySummarization) return false
+  private shouldSummarize(session: Session, measurement: TokenMeasurement, budgetCapped: boolean): boolean {
+    if (!this.config.emergencySummarization || budgetCapped) return false
     const contextWindow = session.requestContext()?.contextWindow
     if (contextWindow === undefined || contextWindow <= 0) return false
     return measurement.totalTokens / contextWindow >= this.config.emergencyThresholdRatio
@@ -420,7 +476,7 @@ export class CodexContextEngine extends CompactionEngine {
     const session = agent.session
     if (options.owner === null) signal?.throwIfAborted()
 
-    const selection = this.validateSurfaceRegion(session, start, end)
+    const selection = validateSurfaceRegion(session, start, end)
     const entryState = inspectCompactionEntryState(session)
     assertCompactionInactive(entryState, 'windowing')
 
@@ -505,25 +561,6 @@ export class CodexContextEngine extends CompactionEngine {
     return result
   }
 
-  /** Validate one requested surface-position span before asynchronous work begins. */
-  private validateSurfaceRegion(session: Session, start: SessionSeq, end: SessionSeq): SurfaceSelection {
-    const nodes = session.surface.nodes
-    const startIdx = nodes.indexOf(start)
-    const endIdx = nodes.indexOf(end)
-    if (startIdx === -1) throw new Error(`windowing: start seq ${String(start)} not found in surface`)
-    if (endIdx === -1) throw new Error(`windowing: end seq ${String(end)} not found in surface`)
-    if (startIdx > endIdx) {
-      throw new Error(
-        `windowing: start seq ${String(start)} (position ${startIdx}) is after end seq ${String(end)} (position ${endIdx})`,
-      )
-    }
-    if (!toolPairingBalancedBefore(session, nodes[startIdx] ?? start)) {
-      throw new Error(`windowing: start seq ${String(start)} is not a balanced boundary (would split a tool-call/result pair)`)
-    }
-    const shadowedSeqs: SessionSeq[] = nodes.slice(startIdx, endIdx + 1)
-    return { start, end, startIdx, endIdx, shadowedSeqs }
-  }
-
   /** Snapshot pricing for a validated span and verify it matches the plan. */
   private prepareCompaction(session: Session, selection: SurfaceSelection): PreparedCompaction {
     const measurement = this.ctx.tokenMeter.measure(session)
@@ -556,7 +593,25 @@ export class CodexContextEngine extends CompactionEngine {
     let result: SummaryResult
     let summaryTexts: readonly string[]
     if (useSummary) {
-      result = await summarizeWithLlm(this.ctx, this.config, buildSummarizationInput(agent.session, prepared.selection), agent, signal)
+      // The parachute is best-effort decoration on top of the routine
+      // template regime: when it fails for any reason short of cancellation
+      // (route errors, capacity, truncation, an empty answer), fall back to
+      // the model-free checkpoint instead of aborting the window — a lost
+      // summary must never leave the session stuck above the budget.
+      try {
+        result = await summarizeWithLlm(this.ctx, this.config, buildSummarizationInput(agent.session, prepared.selection), agent, signal)
+      } catch (error: unknown) {
+        if (signal?.aborted === true) throw error
+        const message = error instanceof Error ? error.message : String(error)
+        this.ctx.logger.warn(
+          `dsh-codex-context: emergency summarization failed (${message}); using the template checkpoint instead`,
+        )
+        result = {
+          summary: [],
+          provider: TEMPLATE_PROVIDER,
+          model: TEMPLATE_MODEL,
+        }
+      }
       summaryTexts = result.summary
         .map(block => block.type === 'text' ? block.text : '')
         .filter(text => text.length > 0)
@@ -654,6 +709,31 @@ export class CodexContextEngine extends CompactionEngine {
 
 // ── module-level transaction helpers ───────────────────────────────────────
 
+/** Validate one requested surface-position span before asynchronous work begins. */
+function validateSurfaceRegion(session: Session, start: SessionSeq, end: SessionSeq): SurfaceSelection {
+  const nodes = session.surface.nodes
+  const startIdx = nodes.indexOf(start)
+  const endIdx = nodes.indexOf(end)
+  if (startIdx === -1) throw new Error(`windowing: start seq ${String(start)} not found in surface`)
+  if (endIdx === -1) throw new Error(`windowing: end seq ${String(end)} not found in surface`)
+  if (startIdx > endIdx) {
+    throw new Error(
+      `windowing: start seq ${String(start)} (position ${startIdx}) is after end seq ${String(end)} (position ${endIdx})`,
+    )
+  }
+  if (!toolPairingBalancedBefore(session, nodes[startIdx] ?? start)) {
+    throw new Error(`windowing: start seq ${String(start)} is not a balanced boundary (would split a tool-call/result pair)`)
+  }
+  // The right edge matters as much as the left one: a span that ends before an
+  // unanswered tool call (or whose tool result outlives its call) leaves the
+  // surface pair-unbalanced and corrupts every later replay fold.
+  if (!toolPairingBalancedAfter(session, nodes[endIdx] ?? end)) {
+    throw new Error(`windowing: end seq ${String(end)} is not a balanced boundary (would split a tool-call/result pair)`)
+  }
+  const shadowedSeqs: SessionSeq[] = nodes.slice(startIdx, endIdx + 1)
+  return { start, end, startIdx, endIdx, shadowedSeqs }
+}
+
 /** Reconstruct open-turn, unmatched-compaction, and seed-boundary state. */
 function inspectCompactionEntryState(session: Session): CompactionEntryState {
   let openTurn: number | null = null
@@ -717,16 +797,27 @@ function assertWholeSurfaceUnchanged(
   }
 }
 
-/** Require only that the selected span remain present, ordered, and equally priced. */
+/** Require only that the selected span remain present, ordered, pair-balanced, and equally priced. */
 function assertSelectedSpanStable(
   measureNodes: (session: Session) => PricedNodes,
   session: Session,
   prepared: PreparedCompaction,
 ): void {
-  const span = measureNodes(session).slice(prepared.selection.startIdx, prepared.selection.endIdx + 1)
-  if (span.length !== prepared.selectedNodes.length
-    || span.some((node, index) => !isDeepStrictEqual(node, prepared.selectedNodes[index]))) {
+  let current: SurfaceSelection
+  try {
+    current = validateSurfaceRegion(session, prepared.selection.start, prepared.selection.end)
+  } catch (error) {
+    throw new SurfaceChangedError(
+      'dsh-codex-context: the selected span is no longer a valid replacement target',
+      { cause: error },
+    )
+  }
+  if (!isDeepStrictEqual([...current.shadowedSeqs], [...prepared.selection.shadowedSeqs])) {
     throw new SurfaceChangedError('dsh-codex-context: the selected span changed during windowing')
+  }
+  const span = measureNodes(session).slice(current.startIdx, current.endIdx + 1)
+  if (!isDeepStrictEqual(span, prepared.selectedNodes)) {
+    throw new SurfaceChangedError('dsh-codex-context: the selected span was rewritten during windowing')
   }
 }
 

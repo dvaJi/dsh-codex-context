@@ -56,7 +56,14 @@ function positiveInt(min: number) {
   return z.number().step(1).min(min)
 }
 
-/** Validated, defaulted configuration schema for the plugin row. */
+/**
+ * Validated, defaulted configuration schema for the plugin row.
+ *
+ * Bounds use the schemastery vocabulary this runtime ships (inclusive
+ * `.min`/`.max`/`.step`; no `.gt`/`.lte`); bounds the per-field schema cannot
+ * express — the open `(0, 1]` lower edge of `emergencyThresholdRatio` — are
+ * enforced by `assertValidConfig` at plugin load.
+ */
 export const CodexContextConfigSchema: z<CodexContextConfig> = z.object({
   auto: z.boolean().default(true),
   targetActiveTokens: positiveInt(1000).default(35_000),
@@ -64,7 +71,7 @@ export const CodexContextConfigSchema: z<CodexContextConfig> = z.object({
   maxExcerptLength: positiveInt(100).default(1000),
   searchDefaultLimit: positiveInt(1).default(3),
   searchMaxScanEvents: positiveInt(100).default(20_000),
-  emergencyThresholdRatio: z.number().gt(0).lte(1).default(0.85),
+  emergencyThresholdRatio: z.number().min(0).max(1).default(0.85),
   emergencySummarization: z.boolean().default(true),
   summarizationProvider: z.string().default(''),
   summarizationModel: z.string().default(''),
@@ -78,5 +85,13 @@ export const CodexContextConfigSchema: z<CodexContextConfig> = z.object({
 export function assertValidConfig(config: CodexContextConfig): void {
   if (config.emergencyThresholdRatio <= 0 || config.emergencyThresholdRatio > 1) {
     throw new Error('dsh-codex-context: emergencyThresholdRatio must be in (0, 1]')
+  }
+  const providerConfigured = config.summarizationProvider.length > 0
+  const modelConfigured = config.summarizationModel.length > 0
+  if (providerConfigured !== modelConfigured) {
+    throw new Error(
+      'dsh-codex-context: summarizationProvider and summarizationModel must be configured together '
+      + 'as an empty or non-empty pair',
+    )
   }
 }

@@ -70,6 +70,68 @@ describe('planWindowCut', () => {
     expect(plan!.cutIdx).toBe(2)
     expect(plan!.reason).toBe('budget-fallback')
   })
+
+  it('cuts at a boundary whose retained tail exactly meets the budget', () => {
+    // Every node costs 100; the tail [4..8) is exactly 400 tokens.
+    const nodes = Array.from({ length: 8 }, (_, seq) => node(seq, 100))
+    const plan = planWindowCut(nodes, { targetTokens: 400, minRetainedNodes: 2 })
+    expect(plan).not.toBeNull()
+    expect(plan!.cutIdx).toBe(4)
+    expect(plan!.retainedTokens).toBe(400)
+    expect(plan!.reason).toBe('budget')
+  })
+
+  it('prefers a fitting user-turn boundary over an older mid-turn one', () => {
+    const nodes = [
+      node(0, 100, { isUserTurnStart: true }),
+      node(1, 100),
+      node(2, 100),
+      node(3, 100),
+      node(4, 100), // oldest fitting boundary — but mid-turn
+      node(5, 100),
+      node(6, 100, { isUserTurnStart: true }), // fitting whole-turn boundary
+      node(7, 100),
+    ]
+    const plan = planWindowCut(nodes, { targetTokens: 400, minRetainedNodes: 2 })
+    expect(plan).not.toBeNull()
+    // Snapped forward to node 6 so the active window reopens on a user turn.
+    expect(plan!.cutIdx).toBe(6)
+    expect(plan!.retained[0]!.isUserTurnStart).toBe(true)
+    expect(plan!.retainedTokens).toBeLessThanOrEqual(400)
+  })
+
+  it('keeps the mid-turn cut when no user-turn boundary fits the budget', () => {
+    const nodes = [
+      node(0, 10_000, { isUserTurnStart: true }), // one huge user turn
+      node(1, 500),
+      node(2, 500),
+      node(3, 500, { balancedBefore: false }), // mid-step boundary is unsafe
+      node(4, 500),
+      node(5, 500),
+    ]
+    const plan = planWindowCut(nodes, { targetTokens: 1500, minRetainedNodes: 2 })
+    expect(plan).not.toBeNull()
+    // Boundary 3 would fit exactly but is unsafe; boundary 4 (mid-turn) is the
+    // oldest safe fitting boundary and no user-turn boundary exists after the
+    // crossing point, so the mid-turn cut stays.
+    expect(plan!.cutIdx).toBe(4)
+    expect(plan!.retained[0]!.isUserTurnStart).toBe(false)
+    expect(plan!.retainedTokens).toBe(1000)
+  })
+
+  it('lets the engine fall back to the maximal cut when the minimum tail exceeds the budget', () => {
+    // Eight 150-token nodes: the newest six alone cost 900 tokens, over the
+    // 850-token budget, so no budget cut can exist — but a maximal overflow
+    // cut can still shadow the two oldest nodes. The engine's pressure path
+    // falls back to planOverflowCut exactly when planWindowCut is null.
+    const nodes = Array.from({ length: 8 }, (_, seq) => node(seq, 150))
+    expect(planWindowCut(nodes, { targetTokens: 850, minRetainedNodes: 6 })).toBeNull()
+    const overflow = planOverflowCut(nodes, { targetTokens: 850, minRetainedNodes: 6 })
+    expect(overflow).not.toBeNull()
+    expect(overflow!.cutIdx).toBe(2)
+    expect(overflow!.retained.length).toBe(6)
+    expect(overflow!.retainedTokens).toBe(900)
+  })
 })
 
 describe('planOverflowCut', () => {

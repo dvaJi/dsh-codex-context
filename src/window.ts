@@ -32,8 +32,8 @@ export interface WindowNode {
   readonly balancedBefore: boolean
   /**
    * Whether this node begins a user turn in the derived history. Cuts prefer
-   * user-turn starts (Codex cuts on user turns; a user message must never be
-   * separated from the assistant response it produced).
+   * user-turn starts (Codex normalizes its window onto whole turns; a user
+   * message must never be separated from the assistant response it produced).
    */
   readonly isUserTurnStart: boolean
 }
@@ -94,10 +94,14 @@ export function planOverflowCut(
  * Budget mode mirrors the reference implementation's backwards walk: starting
  * from the newest node, accumulate the retained tail's tokens; every pair-safe
  * boundary inside the retention minimum is recorded as it passes; when the
- * accumulated window first reaches `targetTokens` the most recent recorded
- * boundary wins. If the whole surface fits before any boundary is recorded,
- * the newest safe boundary is used as a conservative fallback so a legal cut
- * still frees something.
+ * accumulated window first exceeds `targetTokens`, the oldest recorded
+ * boundary wins — the largest tail that still fits (a tail that lands exactly
+ * on the target counts as fitting). When a recorded fitting boundary begins a
+ * user turn, that boundary wins over a mid-turn one of the same budget, so the
+ * active window reopens on a whole turn (Codex's `normalize` invariant)
+ * whenever the budget allows it. If the walk ends below budget without a
+ * usable boundary, the newest safe boundary is used as a conservative
+ * fallback so a legal cut still frees something.
  *
  * Overflow mode frees the maximum: it cuts at the newest safe boundary,
  * keeping exactly `minRetainedNodes` recent nodes.
@@ -128,23 +132,31 @@ function planFrom(
       }
     }
   } else {
-    let lastSafe = -1
+    // Budget mode mirrors the reference implementation's backwards walk and
+    // its `normalize` invariant: retain the largest tail that still fits the
+    // target (the oldest fitting boundary), snapping forward to a user-turn
+    // start whenever one of those fitting boundaries begins a whole turn, so
+    // the active window reopens on a user message and never mid-turn.
+    let lastSafeFit = -1
+    let lastTurnFit = -1
     let crossed = false
     let acc = 0
     for (let i = nodes.length - 1; i >= 1; i -= 1) {
       const node = nodes[i]
       if (node === undefined) continue
       acc += node.tokens
-      // The boundary is recorded only while the window built so far still
-      // fits the target: the cut lands at the newest boundary that keeps the
-      // retained tail under budget, never at the node that crossed it.
-      if (acc >= targetTokens) {
+      // A boundary whose retained tail exactly equals the target still fits:
+      // cross only past it, or the optimal (max-retention) cut is skipped and
+      // the window shadows more than it needs to.
+      if (acc > targetTokens) {
         crossed = true
         break
       }
-      if (i <= newestAllowedCut && isSafe(i)) lastSafe = i
+      if (i > newestAllowedCut || !isSafe(i)) continue
+      lastSafeFit = i
+      if (node.isUserTurnStart) lastTurnFit = i
     }
-    cutIdx = lastSafe
+    cutIdx = lastTurnFit !== -1 ? lastTurnFit : lastSafeFit
     // The walk finished below budget without a usable boundary: fall back to
     // the newest safe boundary so a legal cut still frees something.
     if (cutIdx !== -1 && !crossed) reason = 'budget-fallback'
