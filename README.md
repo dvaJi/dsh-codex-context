@@ -57,13 +57,13 @@ Notes persistence needs **no custom session event type**: the agent loop already
 
 ## Install
 
-The package is a dsh **bundle** (its `package.json` declares `dsh.bundle` with `cordis.patch.yml`). The patch overrides the base `compaction-basic` row by id, so mounting it swaps the summarizing backend for this engine in one line. `command-compact` (`/compact`) and the optional tool-result pruner keep working unchanged.
+The package is a dsh **bundle** (its `package.json` declares `dsh.bundle` with `cordis.patch.yml`). The patch disables the base `compaction-basic` row and mounts this engine as its own `codex-context` row — a leaf row's `name` cannot be rewritten in place and two rows sharing one id are rejected at mount, so this is the loader's supported way to swap the summarizing backend. `command-compact` (`/compact`) and the optional tool-result pruner keep working unchanged against the replacement engine.
 
 From a dsh source checkout (recommended while the `@deepseek-ai/*` npm mirrors hold stale RCs):
 
 ```sh
 dsh plugin --profile demo add /path/to/dsh-codex-context
-dsh --profile demo --dump-config   # shows the replaced compaction row
+dsh --profile demo --dump-config   # base compaction-basic row disabled, codex-context row mounted
 dsh --profile demo
 ```
 
@@ -76,7 +76,7 @@ dsh plugin --profile demo add github:dvaJi/dsh-codex-context#<sha>
 #     dsh-codex-context: true
 ```
 
-Or ship a tarball: `pnpm pack` → `dsh plugin --profile demo add ./dsh-codex-context-0.1.1.tgz`.
+Or ship a tarball: `pnpm pack` → `dsh plugin --profile demo add ./dsh-codex-context-0.1.2.tgz`.
 
 ### Keep summarizing compaction, add only the retrieval layer
 
@@ -94,7 +94,7 @@ Never mount both entries in the same context — the tool names would collide.
 
 ## Configuration
 
-Everything is a config field; all values are optional (schema defaults shown). Add a `config:` block to the bundle row in your profile's `cordis.patch.yml` — a patch replaces the row's whole `config`, so restate every key you care about.
+Everything is a config field; all values are optional (schema defaults shown). Add a `config:` block to the bundle row (`codex-context`) in your profile's `cordis.patch.yml` — a patch replaces the row's whole `config`, so restate every key you care about.
 
 | Field | Default | Meaning |
 |---|---|---|

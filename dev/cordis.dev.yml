@@ -4,12 +4,15 @@
 #   pnpm build
 #   pnpm dsh web --patch ./dev/cordis.dev.yml
 #
-# The row overrides the base `compaction-basic` row by id, the same move the
-# bundle's cordis.patch.yml performs on install. Replace <abs-path-to-repo>
-# with this checkout's absolute path.
+# A leaf row's name cannot be rewritten in place and two rows sharing one id
+# are rejected at mount, so the overlay disables the base `compaction-basic`
+# row and mounts this engine as its own row. Replace <abs-path-to-repo> with
+# this checkout's absolute path.
 
+- id: compaction-basic
+  disabled: true
 - insert:
-    - id: compaction-basic
+    - id: codex-context
       name: '<abs-path-to-repo>/lib/index.js'
       config:
         targetActiveTokens: 35000
