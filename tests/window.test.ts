@@ -118,6 +118,20 @@ describe('planWindowCut', () => {
     expect(plan!.retained[0]!.isUserTurnStart).toBe(false)
     expect(plan!.retainedTokens).toBe(1000)
   })
+
+  it('lets the engine fall back to the maximal cut when the minimum tail exceeds the budget', () => {
+    // Eight 150-token nodes: the newest six alone cost 900 tokens, over the
+    // 850-token budget, so no budget cut can exist — but a maximal overflow
+    // cut can still shadow the two oldest nodes. The engine's pressure path
+    // falls back to planOverflowCut exactly when planWindowCut is null.
+    const nodes = Array.from({ length: 8 }, (_, seq) => node(seq, 150))
+    expect(planWindowCut(nodes, { targetTokens: 850, minRetainedNodes: 6 })).toBeNull()
+    const overflow = planOverflowCut(nodes, { targetTokens: 850, minRetainedNodes: 6 })
+    expect(overflow).not.toBeNull()
+    expect(overflow!.cutIdx).toBe(2)
+    expect(overflow!.retained.length).toBe(6)
+    expect(overflow!.retainedTokens).toBe(900)
+  })
 })
 
 describe('planOverflowCut', () => {

@@ -58,7 +58,7 @@ export function registerSearch(ctx: Context, config: CodexContextConfig): void {
       },
       limit: {
         type: 'integer',
-        description: 'Maximum number of matches to return (defaults to 3; clamps to the configured scan cap)',
+        description: 'Maximum number of matches to return (defaults to the configured searchDefaultLimit; values are clamped to the configured scan cap)',
       },
       scope: {
         type: 'string',
@@ -109,9 +109,12 @@ export function registerSearch(ctx: Context, config: CodexContextConfig): void {
         throw new Error('search_history requires an agent-owned session (no live session is attached to this call)')
       }
       const rawLimit = args.limit
+      // Both the caller-provided limit and the configured default are clamped
+      // to the scan cap, so a misconfigured searchDefaultLimit cannot bypass
+      // the guardrails.
       const limit = typeof rawLimit === 'number' && Number.isInteger(rawLimit) && rawLimit > 0
         ? Math.min(rawLimit, config.searchMaxScanEvents)
-        : config.searchDefaultLimit
+        : Math.min(config.searchDefaultLimit, config.searchMaxScanEvents)
       const scope = args.scope ?? 'cold_only'
       return searchSession(session, exec.callId, args.query, {
         limit,
@@ -161,13 +164,17 @@ export function searchSession(
   let scanned = 0
 
   // Cold first (newest to oldest), then the active window (newest to oldest):
-  // forgotten records outrank what the model can already see.
+  // forgotten records outrank what the model can already see. The traversal
+  // honors cancellation so an aborted request does not pay for a
+  // history-sized allocation up front.
   const scanOrder: Array<{ seq: number; cold: boolean }> = []
   for (let index = upperBound - 1; index >= 0; index -= 1) {
+    if (options.signal?.aborted === true) break
     if (!cold.has(index)) scanOrder.push({ seq: index, cold: true })
   }
   if (options.scope === 'all') {
     for (let index = upperBound - 1; index >= 0; index -= 1) {
+      if (options.signal?.aborted === true) break
       if (cold.has(index)) scanOrder.push({ seq: index, cold: false })
     }
   }

@@ -413,7 +413,12 @@ export class CodexContextEngine extends CompactionEngine {
     }
     const plan = trigger === 'context-overflow'
       ? planOverflowCut(nodes, options)
-      : planWindowCut(nodes, options)
+      // Pressure prefers the budget cut. When even the minimum retained tail
+      // cannot fit the budget (huge recent nodes, or a capped budget smaller
+      // than that tail), no budget cut exists: fall back to the maximal legal
+      // reduction instead of skipping windowing and waiting for a
+      // provider-confirmed overflow.
+      : planWindowCut(nodes, options) ?? planOverflowCut(nodes, options)
     if (plan === null || plan.shadowed.length === 0) return null
     return plan
   }

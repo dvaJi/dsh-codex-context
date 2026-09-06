@@ -103,4 +103,21 @@ describe('compileMatcher', () => {
     const matcher = compileMatcher('foo(bar')
     expect(matcher.exec('call foo(bar) now')?.[0]).toBe('foo(bar')
   })
+
+  it('refuses patterns with nested unbounded quantifiers', () => {
+    expect(() => compileMatcher('(a+)+')).toThrow(/nested unbounded quantifiers/)
+    expect(() => compileMatcher('(a*)*')).toThrow(/nested unbounded quantifiers/)
+    expect(() => compileMatcher('(a?)+')).toThrow(/nested unbounded quantifiers/)
+    expect(() => compileMatcher('(\\w+){2,}')).toThrow(/nested unbounded quantifiers/)
+  })
+
+  it('accepts bounded or flat quantifier usage', () => {
+    expect(() => compileMatcher('foo+')).not.toThrow()
+    expect(() => compileMatcher('(abc)+')).not.toThrow()
+    expect(() => compileMatcher('(ab){2,5}')).not.toThrow()
+    expect(() => compileMatcher('[a+]+')).not.toThrow() // '+' inside a class is literal
+    expect(() => compileMatcher('\\(a\\)+')).not.toThrow() // escaped parens
+    expect(() => compileMatcher('(?:a)+')).not.toThrow()
+    expect(() => compileMatcher('(a+)$')).not.toThrow() // no repetition on the group
+  })
 })

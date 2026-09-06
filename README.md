@@ -49,7 +49,7 @@ This plugin composes those into the 3-tier architecture:
 | Tool | Purpose |
 |---|---|
 | `update_notes` | Update the persistent working notes (goals, modified files, constraints, next steps). Pinned at the top of every subsequent request; survives windowing, compaction, and restarts. |
-| `search_history` | Regex/keyword search over the **full** session log — user prompts, assistant messages (including reasoning), tool calls, and complete tool outputs. Cold (shadowed) history is searched first; excerpts are centered on the match position, not sliced from offset 0. Queries are case-insensitive keywords or regexes of at most 512 characters; an empty or whitespace-only query is rejected. |
+| `search_history` | Regex/keyword search over the **full** session log — user prompts, assistant messages (including reasoning), tool calls, and complete tool outputs. Cold (shadowed) history is searched first; excerpts are centered on the match position, not sliced from offset 0. Queries are case-insensitive keywords or regexes of at most 512 characters; empty or whitespace-only queries are rejected, and patterns with nested unbounded quantifiers (a catastrophic-backtracking hazard, e.g. `(a+)+`) are refused with guidance. |
 
 Notes persistence needs **no custom session event type**: the agent loop already logs dynamic runtime contexts as durable `user/message` snapshots (`source: @deepseek-ai/dsh-system-prompt`, `form: 'snapshot'`) whenever the rendered text changes, and re-logs the snapshot after compaction removes it. Restoring notes is a backward fold over the log for the latest `codex-context:notes` section.
 

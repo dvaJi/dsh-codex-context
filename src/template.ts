@@ -95,9 +95,94 @@ export function matchCenteredExcerpt(
 
 /** Compile a case-insensitive matcher; fall back to an escaped literal when the query is not valid regex. */
 export function compileMatcher(query: string): RegExp {
+  if (hasNestedUnboundedQuantifier(query)) {
+    throw new Error(
+      'the query pattern contains nested unbounded quantifiers (e.g. "(a+)+"), which can hang the search with '
+      + 'catastrophic backtracking; simplify the pattern or use plain keywords',
+    )
+  }
   try {
     return new RegExp(query, 'i')
   } catch {
     return new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i')
   }
+}
+
+/**
+ * Conservative guard for catastrophic backtracking: true when an unbounded
+ * repetition (`*`, `+`, or an open-ended `{m,}`) applies to a group whose
+ * body contains another quantifier. Those shapes — `(a+)+`, `(a*)*`,
+ * `(a?)+`, `(https?://)+` — are where exponential/quadratic backtracking
+ * lives, and a hung `exec()` cannot be interrupted in-process (tool timeouts
+ * are cooperative).
+ *
+ * The check is deliberately lexical and conservative, so some formally safe
+ * patterns (any quantified group containing a `?`) are refused as well — a
+ * refused pattern is a cheap, self-explanatory error the model can rephrase,
+ * while a missed hang is not. Ambiguity-only hazards such as `(a|aa)+` are
+ * not detected: this is a heuristic, not a regex-safety proof.
+ */
+export function hasNestedUnboundedQuantifier(pattern: string): boolean {
+  // Per-group dirty flag: whether an open group's body already contains a
+  // quantifier, indexed by group nesting depth.
+  const groups: boolean[] = []
+  let inClass = false
+  for (let index = 0; index < pattern.length; index += 1) {
+    const char = pattern[index]!
+    if (char === '\\') {
+      // Escaped characters (literal `\(`, `\]`, `\+`, ...) carry no structure.
+      index += 1
+      continue
+    }
+    if (inClass) {
+      if (char === ']') inClass = false
+      continue
+    }
+    if (char === '[') {
+      inClass = true
+      continue
+    }
+    if (char === '(') {
+      groups.push(false)
+      // Group-kind prefixes (`?:`, `?=`, `?!`, `?<`) are not quantifiers.
+      if (pattern[index + 1] === '?') index += 1
+      continue
+    }
+    if (char === ')' && groups.length > 0) {
+      const dirty = groups.pop()!
+      const next = pattern[index + 1]
+      if (dirty && (next === '*' || next === '+' || isUnboundedRangeAt(pattern, index + 1))) {
+        return true
+      }
+      continue
+    }
+    if (groups.length === 0) continue
+    if (char === '*' || char === '+' || char === '?' || isUnboundedRangeAt(pattern, index)) {
+      groups[groups.length - 1] = true
+    }
+  }
+  return false
+}
+
+/** Whether `{m,}` (or `{,n}`/`{m, n}` with an open upper end) starts at `index`. */
+function isUnboundedRangeAt(pattern: string, index: number): boolean {
+  if (pattern[index] !== '{') return false
+  let cursor = index + 1
+  let sawDigit = false
+  let sawComma = false
+  while (cursor < pattern.length) {
+    const char = pattern[cursor]!
+    if (char === '}') return sawComma
+    if (char === ',') {
+      if (sawComma) return false
+      sawComma = true
+    } else if (char >= '0' && char <= '9') {
+      sawDigit = true
+    } else if (char !== ' ' && char !== '\t') {
+      // Not a valid range; `{` was a literal character.
+      return false
+    }
+    cursor += 1
+  }
+  return sawDigit && sawComma
 }
